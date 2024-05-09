@@ -1,169 +1,298 @@
 import maya.cmds as mc
-from PySide2.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QListWidget, QAbstractButton, QAbstractItemView
+
+from PySide2.QtCore import Signal, Qt
+from PySide2.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QAbstractItemView, QPushButton, QLabel, QListWidget, QColorDialog, QSlider
+from PySide2.QtGui import QColor, QPainter, QBrush
 
 def GetCurrentFrame():
     return int(mc.currentTime(q=True))
 
-class Ghost:
+class Ghost():
     def __init__(self):
-        self.srcMeshes = set() # a set is a list that has unique elements.
-        self.ghostGrp = "ghost_grp"
-        self.frameAttr = "frame"
-        self.srcAttr = "src"
+        self.srcMeshs = set()
+        self.InitGhostGrpIfNotExist()
+        self.InitSrcMeshFromGhostGrp()
+        self.ghostColor = [0,0,0]
+        self.baseTransparency = 0
+        self.transparencyRange = 60
+        self.timeJob = mc.scriptJob(e=["timeChanged",self.CurrentTimeChanged])
 
-    def InitIfGhostGrpNotExist(self):
-        if mc.objExists(self.ghostGrp):
-            storedSrcMeshes = mc.getAttr(self.ghostGrp + "." + self.srcAttr)
-            self.srcMeshes = set(storedSrcMeshes.split(","))
+    def CurrentTimeChanged(self):
+        self.UpdateGhostTransparency()
+
+    def UpdateTransparencyRange(self, newRange):
+        self.transparencyRange = newRange 
+        self.UpdateGhostTransparency()
+
+    def UpdateBaseTranparency(self, newTransparency):      
+        self.baseTransparency = newTransparency
+        self.UpdateGhostTransparency()
+
+    def UpdateGhostTransparency(self):
+        allGhosts = mc.listRelatives(self.GetGhostGrpName(), c=True)
+        if not allGhosts:
+            return
+
+        for ghost in allGhosts:
+            ghostFrame = mc.getAttr(ghost + "."+self.GetFrameAttr())
+            currentFrame = GetCurrentFrame()
+            distance = abs(currentFrame - ghostFrame)
+            
+            ghostMat = self.GetShaderNameForGhost(ghost)
+        
+            if distance > self.transparencyRange:
+                mc.setAttr(ghostMat + ".transparency", 1,1,1, type = "double3")
+                continue
+
+            normalizeDist = distance / self.transparencyRange
+            mc.setAttr(ghostMat + ".transparency", normalizeDist, normalizeDist, normalizeDist, type = "double3")
+
+    def DeleteSelectedGhost(self):
+        for srcMesh in self.srcMeshs:
+            ghostName = srcMesh + self.GetGhostSubfix() + str(GetCurrentFrame())
+            self.DeleteGhost(ghostName)            
+
+    def UpdateGhostColors(self, r, g, b):
+        self.ghostColor[0] = r
+        self.ghostColor[1] = g
+        self.ghostColor[2] = b
+        allGhosts = mc.listRelatives(self.GetGhostGrpName(), c=True)
+        for ghost in allGhosts:
+            self.SetGhostColor(ghost, r, g, b)
+
+    def DeleteGhost(self, ghostName):
+        ghostSg = self.GetShaderEngineForGhost(ghostName)
+        if mc.objExists(ghostSg):
+            mc.delete(ghostSg)
+
+        ghostMat = self.GetShaderNameForGhost(ghostName)
+        if mc.objExists(ghostMat):
+            mc.delete(ghostMat)
+
+        if mc.objExists(ghostName):
+            mc.delete(ghostName)
+
+    def SetGhostColor(self, ghost, r, g, b):
+        ghostMat = self.GetShaderNameForGhost(ghost)
+        mc.setAttr(ghostMat + ".color", r, g, b, type = "double3")
+
+    def DeleteAllGhosts(self):
+        allGhost = mc.listRelatives(self.GetGhostGrpName(), c=True)
+        if not allGhost:
+            return
+
+        for ghost in allGhost:
+            self.DeleteGhost(ghost)
+
+    def InitSrcMeshFromGhostGrp(self):
+        srcMeshAttr = mc.getAttr(self.GetGhostGrpName() + "." + self.GetSrcMeshAttr())
+        if not srcMeshAttr:
             return
         
-        mc.createNode("transform", n = self.ghostGrp)
-        mc.addAttr(self.ghostGrp, ln = self.srcAttr, dt="string")
-    
-    def SetSelectedAsSrcMesh(self):
-        selection = mc.ls(sl=True)
-        self.srcMeshes.clear() # removes all elements in the set.
-        for selected in selection:
-            shapes = mc.listRelatives(selected, s=True)
-            for s in shapes:
-                if mc.objectType(s) == "mesh" : #the object is a mesh
-                    self.srcMeshes.add(selected) # add the mesh to our set
-    
-    def AddGhost(self):
-        for srcMesh in self.srcMeshes:
-            currentFrame = GetCurrentFrame()
-            ghostName = srcMesh + "_" + str(currentFrame)
-            if mc.objExists(ghostName):
-                mc.delete(ghostName)
+        meshes = srcMeshAttr.split(",")
+        self.srcMeshs = set(meshes)
 
-            dup = mc.duplicate(srcMesh, n=ghostName)
-            # Create the group if it doesn't exist
-            if not mc.objExists(self.ghostGrp):
-                mc.createNode("transform", n=self.ghostGrp)
-            # Parent the duplicate under the group
-            mc.parent(ghostName, self.ghostGrp)
-            mc.addAttr(ghostName, ln=self.frameAttr, dv=currentFrame)
-    
-    def DeleteAllGhosts(self):
-        if mc.objExists(self.ghostGrp):
-            mc.delete(mc.listRelatives(self.ghostGrp, c=True))
+    def InitGhostGrpIfNotExist(self):
+        if not mc.objExists(self.GetGhostGrpName()):
+            mc.createNode("transform", n = self.GetGhostGrpName())
+            mc.addAttr(self.GetGhostGrpName(), ln = self.GetSrcMeshAttr(), dt = "string")
+
+    def GetSrcMeshAttr(self):
+        return "src"
+
+    def GetGhostGrpName(self):
+        return "Ghost_grp"
 
     def GoToNextGhost(self):
-        frames = self.GetGhostFramesSorted()
-        if not frames:
-            return
-        
         currentFrame = GetCurrentFrame()
+        frames = self.GetGhostFramesSorted()
+        nextFrame = frames[0]
         for frame in frames:
             if frame > currentFrame:
-                mc.currentTime(frame, e=True)
-                return
+                nextFrame = frame
+                break
         
-        mc.currentTime(frames[0], e=True)
-
-    def DeleteGhostOnFrame(self, frame):
-        # Get all ghosts
-        ghosts = mc.listRelatives(self.ghostGrp, c=True) or []
-
-        # Iterate over each ghost
-        for ghost in ghosts:
-            # Get the frame attribute value of the ghost
-            ghost_frame = mc.getAttr(ghost + "." + self.frameAttr)
-            # Check if the ghost is on the specified frame
-            if ghost_frame == frame:
-                # Delete the ghost
-                mc.delete(ghost)
+        mc.currentTime(nextFrame, e=True)
 
     def GoToPrevGhost(self):
-        frames = self.GetGhostFramesSorted()
-        if not frames:
-            return
         currentFrame = GetCurrentFrame()
+        frames = self.GetGhostFramesSorted()
+        nextFrame = frames[-1]
+        
         frames.reverse()
         for frame in frames:
             if frame < currentFrame:
-                mc.currentTime(frame, e=True)
-                return
+                nextFrame = frame
+                break
 
+        mc.currentTime(nextFrame, e=True)
 
     def GetGhostFramesSorted(self):
-        frames = set()
-        ghosts = mc.listRelatives(self.ghostGrp, c =True)
-        if not ghosts:
-            return[]
-        
+        ghosts = mc.listRelatives(self.GetGhostGrpName(), c=True)
+        frames = set() 
         for ghost in ghosts:
-            frame = mc.getAttr(ghost + "." + self.frameAttr)
+            frame = mc.getAttr(ghost + "." + self.GetFrameAttr())
             frames.add(frame)
 
         frames = list(frames)
         frames.sort()
         return frames
 
+    def GetGhostSubfix(self):
+        return "_ghost_"
 
+    def AddGhost(self):
+        for srcMesh in self.srcMeshs:
+            ghostName = srcMesh + self.GetGhostSubfix() + str(GetCurrentFrame())
+            if mc.objExists(ghostName):
+                mc.delete(ghostName)
+
+            mc.duplicate(srcMesh, n = ghostName)
+            mc.addAttr(ghostName, ln = self.GetFrameAttr(), dv = GetCurrentFrame())
+            mc.parent(ghostName, self.GetGhostGrpName())
+            self.CreateMaterialForGhost(ghostName)
+            self.SetGhostColor(ghostName, self.ghostColor[0], self.ghostColor[1], self.ghostColor[2])
+
+    def GetFrameAttr(self):
+        return "frame"
+
+    def InitSrcMeshesWithSel(self):
+        selection = mc.ls(sl=True)
+        self.srcMeshs.clear()  
+        for sel in selection:
+            shapes = mc.listRelatives(sel, s=True)
+            for s in shapes:
+                if mc.objectType(s) == "mesh":
+                    self.srcMeshs.add(sel)
+
+        mc.setAttr(self.GetGhostGrpName() + "." + self.GetSrcMeshAttr(), ",".join(self.srcMeshs), typ="string")
+
+    def CreateMaterialForGhost(self, ghost):        
+        matName = self.GetShaderNameForGhost(ghost)
+        if not mc.objExists(matName):
+            mc.shadingNode("lambert", asShader = True, name = matName)
+        
+        setName = self.GetShaderEngineForGhost(ghost)
+        if not mc.objExists(setName):
+            mc.sets(name = setName, renderable = True, empty = True)
+
+        mc.connectAttr(matName + ".outColor", setName + ".surfaceShader", force = True)
+        mc.sets(ghost, edit=True, forceElement = setName)
+
+    def GetShaderEngineForGhost(self, ghost):
+        return ghost + "_sg"
+
+    def GetShaderNameForGhost(self, ghost):
+        return ghost + "_mat"
+
+class ColorPicker(QWidget):
+    colorChanged = Signal(QColor)
+    def __init__(self, width = 80, height = 20):
+        super().__init__()
+        self.setFixedSize(width, height)
+        self.color = QColor(128, 128, 128)
+
+    def mousePressEvent(self, event):
+        color = QColorDialog().getColor(self.color)
+        self.color = color
+        self.colorChanged.emit(self.color)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setBrush(QBrush(self.color))
+        painter.drawRect(0,0, self.width(), self.height())      
 
 class GhostWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.ghost = Ghost()
-        self.setWindowTitle("Allen's Ghost")
+        self.setWindowTitle("Ghoster")
         self.masterLayout = QVBoxLayout()
         self.setLayout(self.masterLayout)
+        self.CreateMeshSelSection()
+        self.CreateMatCtrlSection()
+        self.CreateCtrlSection()
 
-        self.srcMechList = QListWidget()
-        self.srcMechList.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.srcMechList.itemSelectionChanged.connect(self.SrcMeshSelectionChanged)
-        self.srcMechList.addItems(self.ghost.srcMeshes)
-        self.masterLayout.addWidget(self.srcMechList)
+    def CreateMatCtrlSection(self):
+        layout = QHBoxLayout()
+        self.masterLayout.addLayout(layout)
+        
+        self.ghostColorPicker = ColorPicker()
+        self.ghostColorPicker.colorChanged.connect(self.GhostColorPickerColorChanged)
+        layout.addWidget(self.ghostColorPicker)
 
-        addSrcMeshBtn = QPushButton("Add Source Mesh")
-        addSrcMeshBtn.clicked.connect(self.AddSrcMeshBtnClicked)
-        self.masterLayout.addWidget(addSrcMeshBtn)
+        transSlider = QSlider()
+        transSlider.setOrientation(Qt.Horizontal)
+        transSlider.setMinimum(0)
+        transSlider.setMaximum(100)
+        transSlider.valueChanged.connect(self.BaseTransparencyChanged)
+        layout.addWidget(transSlider)
 
-        self.ctrlLayout = QHBoxLayout()
-        self.masterLayout.addLayout(self.ctrlLayout)
+        visCtrlLayout = QHBoxLayout()
+        self.masterLayout.addLayout(visCtrlLayout)
+
+        rangeLabel = QLabel("Transparecy Range")
+        visCtrlLayout.addWidget(rangeLabel)
+        rangeSlider = QSlider()
+        rangeSlider.setOrientation(Qt.Horizontal)
+        rangeSlider.setMinimum(0)
+        rangeSlider.setMaximum(60)
+        rangeSlider.valueChanged.connect(self.TransparencyRangeChanged)
+        visCtrlLayout.addWidget(rangeSlider)
+
+    def BaseTransparencyChanged(self, value):
+        self.ghost.UpdateBaseTranparency(value/100)        
+
+    def TransparencyRangeChanged(self, value):
+        self.ghost.UpdateTransparencyRange(value)        
+
+    def GhostColorPickerColorChanged(self, newColor:QColor):
+        self.ghost.UpdateGhostColors(newColor.redF(), newColor.greenF(), newColor.blueF())
+
+    def CreateCtrlSection(self):
+        layout = QHBoxLayout()
+        self.masterLayout.addLayout(layout)
 
         addGhostBtn = QPushButton("Add")
-        addGhostBtn.clicked.connect(self.ghost.AddGhost)
-        self.ctrlLayout.addWidget(addGhostBtn)
+        addGhostBtn.clicked.connect(self.ghost.AddGhost) 
+        layout.addWidget(addGhostBtn)
 
-        prevGhostBtn = QPushButton("Prev")
-        prevGhostBtn.clicked.connect(self.ghost.GoToPrevGhost)
-        self.ctrlLayout.addWidget(prevGhostBtn)
+        prevBtn = QPushButton("<<<")
+        prevBtn.clicked.connect(self.ghost.GoToPrevGhost)
+        layout.addWidget(prevBtn)
 
-        nextGhostBtn = QPushButton("Next")
-        nextGhostBtn.clicked.connect(self.ghost.GoToNextGhost)
-        self.ctrlLayout.addWidget(nextGhostBtn)
+        nextBtn = QPushButton(">>>")
+        nextBtn.clicked.connect(self.ghost.GoToNextGhost)
+        layout.addWidget(nextBtn)
 
-        self.deleteLayout = QHBoxLayout()  # Create a layout for delete buttons
-        self.masterLayout.addLayout(self.deleteLayout)  # Add delete layout to master layout
+        delBtn = QPushButton("Del")
+        delBtn.clicked.connect(self.ghost.DeleteSelectedGhost)
+        layout.addWidget(delBtn)
 
-        deleteGhostOnFrameBtn = QPushButton("Delete Ghost on Frame")
-        deleteGhostOnFrameBtn.clicked.connect(self.DeleteGhostOnFrameBtnClicked)
-        self.deleteLayout.addWidget(deleteGhostOnFrameBtn)
+        delAllBtn = QPushButton("Del All")
+        delAllBtn.clicked.connect(self.ghost.DeleteAllGhosts)
+        layout.addWidget(delAllBtn)
 
-        deleteAllGhostsBtn = QPushButton("Delete All Ghosts")
-        deleteAllGhostsBtn.clicked.connect(self.DeleteAllGhostsBtnClicked)
-        self.deleteLayout.addWidget(deleteAllGhostsBtn)
+    def CreateMeshSelSection(self):
+        self.SrcMeshList = QListWidget()
+        self.SrcMeshList.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.SrcMeshList.itemSelectionChanged.connect(self.SrcMeshListSelecionChanged)
+        self.masterLayout.addWidget(self.SrcMeshList)
+        setSrcMeshBtn = QPushButton("Set Selected as Source")
+        setSrcMeshBtn.clicked.connect(self.SetSrcMeshBtnClicked)
+        self.masterLayout.addWidget(setSrcMeshBtn)
+        self.SrcMeshList.addItems(self.ghost.srcMeshs)
 
-    def SrcMeshSelectionChanged(self):
+    def SetSrcMeshBtnClicked(self):
+        self.ghost.InitSrcMeshesWithSel()
+        self.SrcMeshList.clear()
+        self.SrcMeshList.addItems(self.ghost.srcMeshs)
+
+    def SrcMeshListSelecionChanged(self):
         mc.select(cl=True)
-        for item in self.srcMechList.selectedItems():
+        for item in self.SrcMeshList.selectedItems():
             mc.select(item.text(), add=True)
-
-    def AddSrcMeshBtnClicked(self):
-        self.ghost.SetSelectedAsSrcMesh()
-        self.srcMechList.clear()
-        self.srcMechList.addItems(self.ghost.srcMeshes)
-
-    def DeleteGhostOnFrameBtnClicked(self):
-        # Get the current frame
-        currentFrame = GetCurrentFrame()
-        # Call the DeleteGhostOnFrame method of the Ghost object
-        self.ghost.DeleteGhostOnFrame(currentFrame)
-
-    def DeleteAllGhostsBtnClicked(self):
-        self.ghost.DeleteAllGhosts()
 
 ghostWidget = GhostWidget()
 ghostWidget.show()
